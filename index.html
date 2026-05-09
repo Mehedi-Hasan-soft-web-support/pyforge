@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1105,31 +1106,82 @@ async function ensureRepoInitialized() {
   await new Promise(r => setTimeout(r, 2000)); // let GitHub settle
 }
 
+// ── Get default branch name ───────────────────────────────────────────────────
+async function getDefaultBranch() {
+  const repo = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}`);
+  return repo.default_branch || 'main';
+}
+
+// ── Push files using Git Tree API (handles nested paths like .github/workflows/) ──
+// Contents API fails with "Not Found" when intermediate directories don't exist.
+// Git Tree API is the ONLY reliable way to create deeply nested paths.
+async function pushFilesViaTreeAPI(files, commitMessage) {
+  const branch = await getDefaultBranch();
+
+  // 1. Get current HEAD commit SHA
+  const ref = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/${branch}`);
+  const headCommitSha = ref.object.sha;
+
+  // 2. Get the tree SHA of the current HEAD commit
+  const headCommit = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/commits/${headCommitSha}`);
+  const baseTreeSha = headCommit.tree.sha;
+
+  // 3. Create blobs for each file
+  const treeItems = [];
+  for (const file of files) {
+    const bytes = new TextEncoder().encode(file.content);
+    let binary = '';
+    bytes.forEach(b => binary += String.fromCharCode(b));
+    const b64 = btoa(binary);
+
+    const blob = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/blobs`, 'POST', {
+      content: b64,
+      encoding: 'base64'
+    });
+    treeItems.push({ path: file.path, mode: '100644', type: 'blob', sha: blob.sha });
+  }
+
+  // 4. Create a new tree on top of the base tree
+  const newTree = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/trees`, 'POST', {
+    base_tree: baseTreeSha,
+    tree: treeItems
+  });
+
+  // 5. Create a new commit pointing to the new tree
+  const newCommit = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/commits`, 'POST', {
+    message: commitMessage,
+    tree: newTree.sha,
+    parents: [headCommitSha]
+  });
+
+  // 6. Move the branch ref to the new commit
+  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/${branch}`, 'PATCH', {
+    sha: newCommit.sha,
+    force: false
+  });
+
+  return newCommit.sha;
+}
+
 // ── Ensure workflow file exists ───────────────────────────────────────────────
 async function ensureWorkflowExists() {
   const wfPath = '.github/workflows/pyforge-build.yml';
-  const yaml = buildWorkflowYAML();
 
-  // btoa for workflow YAML (ASCII safe)
-  const b64 = btoa(unescape(encodeURIComponent(yaml)));
-
-  let sha = null;
   try {
-    const existing = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`);
-    sha = existing.sha;
-    log('Updating workflow file...', 'info');
+    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`);
+    log('Workflow file already exists ✓', 'success');
+    return;
   } catch(e) {
-    log('Creating GitHub Actions workflow...', 'info');
+    log('Creating GitHub Actions workflow via Git Tree API...', 'info');
   }
 
-  const body = {
-    message: sha ? 'Update PyForge workflow' : 'Add PyForge build workflow',
-    content: b64
-  };
-  if (sha) body.sha = sha;
-
-  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`, 'PUT', body);
-  log('Workflow ready ✓', 'success');
+  const yaml = buildWorkflowYAML();
+  await pushFilesViaTreeAPI(
+    [{ path: wfPath, content: yaml }],
+    '[PyForge] Add GitHub Actions build workflow'
+  );
+  log('Workflow created ✓', 'success');
+  await new Promise(r => setTimeout(r, 1500));
 }
 
 // ── Poll for build completion ─────────────────────────────────────────────────
@@ -1249,12 +1301,15 @@ async function startBuild() {
       noconsole
     };
 
-    // 4. Push source + config — these two pushes trigger the workflow
-    log('Pushing Python source code...', 'info');
-    await pushFile('src/main.py', code, `[PyForge] Update source ${new Date().toISOString()}`);
-
-    log('Pushing build config...', 'info');
-    await pushFile('build_config.json', JSON.stringify(buildConfig, null, 2), '[PyForge] Update build config');
+    // 4. Push source + config in ONE commit via Tree API (single trigger, no race)
+    log('Pushing source code + build config...', 'info');
+    await pushFilesViaTreeAPI(
+      [
+        { path: 'src/main.py',       content: code },
+        { path: 'build_config.json', content: JSON.stringify(buildConfig, null, 2) }
+      ],
+      `[PyForge] Build ${exeName} @ ${new Date().toISOString()}`
+    );
 
     log('✅ Code pushed! Waiting for GitHub Actions to start...', 'success');
     log('⏳ PyQt5 EXE build লাগবে ৪-৬ মিনিট (first run)...', 'warn');
