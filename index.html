@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1080,53 +1079,46 @@ async function pushFile(path, content, message) {
   await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${path}`, 'PUT', body);
 }
 
-// ── Ensure repo has at least one commit (initialize if empty) ─────────────────
-async function ensureRepoInitialized() {
-  try {
-    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/main`);
-    log('Repository has commits ✓', 'success');
-    return; // already has commits
-  } catch(e) {}
 
-  // Try 'master' branch
-  try {
-    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/master`);
-    log('Repository has commits (master branch) ✓', 'success');
-    return;
-  } catch(e) {}
 
-  // Repo is empty — create initial README commit via Contents API
-  log('Repository is empty → Initializing with README...', 'warn');
-  const readmeB64 = btoa('# PyForge Builder\nThis repository is used by PyForge to build Python EXE files via GitHub Actions.\n');
-  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/README.md`, 'PUT', {
-    message: 'Initial commit by PyForge',
-    content: readmeB64
-  });
-  log('Repository initialized ✓', 'success');
-  await new Promise(r => setTimeout(r, 2000)); // let GitHub settle
+// ── Resolve actual branch + HEAD commit SHA (robust, handles empty/new repos) ─
+async function resolveHead() {
+  // Step 1: get default_branch from repo metadata
+  const repoMeta = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}`);
+  const branch = repoMeta.default_branch || 'main';
+
+  // Step 2: list ALL refs so we can confirm the branch actually exists
+  let headSha = null;
+  try {
+    const refs = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs`);
+    // refs is an array like [{ref: "refs/heads/main", object: {sha:...}}, ...]
+    const found = refs.find(r => r.ref === `refs/heads/${branch}`);
+    if (found) headSha = found.object.sha;
+  } catch(e) { /* empty repo returns 409 or empty array */ }
+
+  return { branch, headSha };
 }
 
-// ── Get default branch name ───────────────────────────────────────────────────
-async function getDefaultBranch() {
-  const repo = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}`);
-  return repo.default_branch || 'main';
-}
-
-// ── Push files using Git Tree API (handles nested paths like .github/workflows/) ──
-// Contents API fails with "Not Found" when intermediate directories don't exist.
-// Git Tree API is the ONLY reliable way to create deeply nested paths.
+// ── Push files using Git Tree API ─────────────────────────────────────────────
+// This is the ONLY reliable way to create .github/workflows/ on GitHub API.
+// Contents API returns 404 whenever an intermediate directory does not exist.
 async function pushFilesViaTreeAPI(files, commitMessage) {
-  const branch = await getDefaultBranch();
+  const { branch, headSha } = await resolveHead();
 
-  // 1. Get current HEAD commit SHA
-  const ref = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/${branch}`);
-  const headCommitSha = ref.object.sha;
+  if (!headSha) {
+    throw new Error(
+      `Branch "${branch}" has no commits yet. ` +
+      'Please create the repo with "Add a README file" checked, then retry.'
+    );
+  }
 
-  // 2. Get the tree SHA of the current HEAD commit
-  const headCommit = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/commits/${headCommitSha}`);
+  // 1. Get base tree SHA from HEAD commit
+  const headCommit = await githubAPI(
+    `/repos/${CONFIG.username}/${CONFIG.repo}/git/commits/${headSha}`
+  );
   const baseTreeSha = headCommit.tree.sha;
 
-  // 3. Create blobs for each file
+  // 2. Create blobs
   const treeItems = [];
   for (const file of files) {
     const bytes = new TextEncoder().encode(file.content);
@@ -1134,45 +1126,65 @@ async function pushFilesViaTreeAPI(files, commitMessage) {
     bytes.forEach(b => binary += String.fromCharCode(b));
     const b64 = btoa(binary);
 
-    const blob = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/blobs`, 'POST', {
-      content: b64,
-      encoding: 'base64'
-    });
+    const blob = await githubAPI(
+      `/repos/${CONFIG.username}/${CONFIG.repo}/git/blobs`, 'POST',
+      { content: b64, encoding: 'base64' }
+    );
     treeItems.push({ path: file.path, mode: '100644', type: 'blob', sha: blob.sha });
   }
 
-  // 4. Create a new tree on top of the base tree
-  const newTree = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/trees`, 'POST', {
-    base_tree: baseTreeSha,
-    tree: treeItems
-  });
+  // 3. Create new tree
+  const newTree = await githubAPI(
+    `/repos/${CONFIG.username}/${CONFIG.repo}/git/trees`, 'POST',
+    { base_tree: baseTreeSha, tree: treeItems }
+  );
 
-  // 5. Create a new commit pointing to the new tree
-  const newCommit = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/commits`, 'POST', {
-    message: commitMessage,
-    tree: newTree.sha,
-    parents: [headCommitSha]
-  });
+  // 4. Create commit
+  const newCommit = await githubAPI(
+    `/repos/${CONFIG.username}/${CONFIG.repo}/git/commits`, 'POST',
+    { message: commitMessage, tree: newTree.sha, parents: [headSha] }
+  );
 
-  // 6. Move the branch ref to the new commit
-  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/${branch}`, 'PATCH', {
-    sha: newCommit.sha,
-    force: false
-  });
+  // 5. Advance branch ref
+  await githubAPI(
+    `/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/${branch}`, 'PATCH',
+    { sha: newCommit.sha, force: false }
+  );
 
-  return newCommit.sha;
+  return { commitSha: newCommit.sha, branch };
+}
+
+// ── Ensure repo has at least one real commit ──────────────────────────────────
+async function ensureRepoInitialized() {
+  const { headSha } = await resolveHead();
+  if (headSha) {
+    log('Repository has commits ✓', 'success');
+    return;
+  }
+
+  // Truly empty repo — use Contents API for the very first file (works on empty repos)
+  log('Repository is empty → creating initial commit...', 'warn');
+  const b64 = btoa('# PyForge Builder\n\nAuto-build Python EXE via GitHub Actions.\n');
+  await githubAPI(
+    `/repos/${CONFIG.username}/${CONFIG.repo}/contents/README.md`, 'PUT',
+    { message: '[PyForge] Initial commit', content: b64 }
+  );
+  log('Initial commit created ✓', 'success');
+  // Wait for GitHub to settle before any Git API calls
+  await new Promise(r => setTimeout(r, 3000));
 }
 
 // ── Ensure workflow file exists ───────────────────────────────────────────────
 async function ensureWorkflowExists() {
   const wfPath = '.github/workflows/pyforge-build.yml';
 
+  // Check existence via Contents API (cheap GET, works fine for existing files)
   try {
     await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`);
     log('Workflow file already exists ✓', 'success');
     return;
   } catch(e) {
-    log('Creating GitHub Actions workflow via Git Tree API...', 'info');
+    log('Creating workflow via Git Tree API...', 'info');
   }
 
   const yaml = buildWorkflowYAML();
@@ -1181,7 +1193,7 @@ async function ensureWorkflowExists() {
     '[PyForge] Add GitHub Actions build workflow'
   );
   log('Workflow created ✓', 'success');
-  await new Promise(r => setTimeout(r, 1500));
+  await new Promise(r => setTimeout(r, 2000));
 }
 
 // ── Poll for build completion ─────────────────────────────────────────────────
