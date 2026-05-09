@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -919,6 +918,7 @@ function showProgress(show) {
   document.getElementById('progress-bar').classList.toggle('show', show);
 }
 
+// ── GitHub API helper ────────────────────────────────────────────────────────
 async function githubAPI(path, method = 'GET', body = null) {
   const opts = {
     method,
@@ -935,11 +935,62 @@ async function githubAPI(path, method = 'GET', body = null) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.message || `HTTP ${res.status}`);
   }
+  // 204 No Content — return empty object
+  if (res.status === 204) return {};
   return res.json();
 }
 
-async function ensureWorkflowExists() {
-  const workflowContent = btoa(`name: Build EXE
+// ── Detect hidden imports needed from code ───────────────────────────────────
+function detectHiddenImports(code) {
+  const hints = [];
+  if (/PyQt5/i.test(code)) {
+    hints.push(
+      'PyQt5', 'PyQt5.QtCore', 'PyQt5.QtGui', 'PyQt5.QtWidgets',
+      'PyQt5.sip', 'PyQt5.QtPrintSupport'
+    );
+  }
+  if (/pyqtgraph/i.test(code)) hints.push('pyqtgraph', 'pyqtgraph.graphicsItems');
+  if (/tkinter/i.test(code)) hints.push('tkinter', 'tkinter.ttk', '_tkinter');
+  if (/customtkinter/i.test(code)) hints.push('customtkinter');
+  if (/PIL|pillow/i.test(code)) hints.push('PIL');
+  if (/numpy/i.test(code)) hints.push('numpy');
+  if (/pandas/i.test(code)) hints.push('pandas');
+  if (/matplotlib/i.test(code)) hints.push('matplotlib', 'matplotlib.backends.backend_tkagg');
+  if (/cv2|opencv/i.test(code)) hints.push('cv2');
+  if (/serial/i.test(code)) hints.push('serial', 'serial.tools.list_ports');
+  if (/requests/i.test(code)) hints.push('requests');
+  if (/supabase/i.test(code)) hints.push('supabase');
+  return hints;
+}
+
+// ── Detect packages to install from code ─────────────────────────────────────
+function autoDetectPackages(code) {
+  const pkgMap = {
+    'PyQt5': 'PyQt5',
+    'pyqtgraph': 'pyqtgraph',
+    'customtkinter': 'customtkinter',
+    'PIL': 'Pillow',
+    'numpy': 'numpy',
+    'pandas': 'pandas',
+    'matplotlib': 'matplotlib',
+    'cv2': 'opencv-python-headless',
+    'serial': 'pyserial',
+    'requests': 'requests',
+    'supabase': 'supabase',
+    'scipy': 'scipy',
+    'sklearn': 'scikit-learn',
+    'paho': 'paho-mqtt',
+  };
+  const found = new Set();
+  for (const [imp, pkg] of Object.entries(pkgMap)) {
+    if (code.includes(imp)) found.add(pkg);
+  }
+  return [...found];
+}
+
+// ── Build the workflow YAML string ───────────────────────────────────────────
+function buildWorkflowYAML() {
+  return `name: PyForge Build EXE
 on:
   push:
     paths:
@@ -950,98 +1001,160 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Read config
+
+      - name: Read build_config.json
         id: cfg
-        shell: bash
+        shell: python
         run: |
-          EXE_NAME=$(python -c "import json; d=json.load(open('build_config.json')); print(d['exe_name'])")
-          PY_VER=$(python -c "import json; d=json.load(open('build_config.json')); print(d['python_version'])")
-          PACKAGES=$(python -c "import json; d=json.load(open('build_config.json')); print(d.get('packages',''))")
-          ONEFILE=$(python -c "import json; d=json.load(open('build_config.json')); print(d.get('onefile', True))")
-          NOCONSOLE=$(python -c "import json; d=json.load(open('build_config.json')); print(d.get('noconsole', False))")
-          echo "exe_name=$EXE_NAME" >> $GITHUB_OUTPUT
-          echo "py_ver=$PY_VER" >> $GITHUB_OUTPUT
-          echo "packages=$PACKAGES" >> $GITHUB_OUTPUT
-          echo "onefile=$ONEFILE" >> $GITHUB_OUTPUT
-          echo "noconsole=$NOCONSOLE" >> $GITHUB_OUTPUT
+          import json, os
+          d = json.load(open('build_config.json'))
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a') as f:
+            f.write(f"exe_name={d['exe_name']}\\n")
+            f.write(f"py_ver={d['python_version']}\\n")
+            f.write(f"packages={d.get('packages','')}\\n")
+            f.write(f"onefile={d.get('onefile', True)}\\n")
+            f.write(f"noconsole={d.get('noconsole', False)}\\n")
+            f.write(f"hidden_imports={d.get('hidden_imports','')}\\n")
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: \${{ steps.cfg.outputs.py_ver }}
+
       - name: Install dependencies
         shell: bash
         run: |
+          python -m pip install --upgrade pip
           pip install pyinstaller
           PKGS="\${{ steps.cfg.outputs.packages }}"
-          if [ -n "$PKGS" ]; then pip install $PKGS; fi
-      - name: Build EXE
+          if [ -n "$PKGS" ]; then
+            echo "Installing: $PKGS"
+            pip install $PKGS
+          fi
+
+      - name: Build EXE with PyInstaller
         shell: bash
         run: |
           ARGS="--name \${{ steps.cfg.outputs.exe_name }}"
-          if [ "\${{ steps.cfg.outputs.onefile }}" = "True" ]; then ARGS="$ARGS --onefile"; fi
-          if [ "\${{ steps.cfg.outputs.noconsole }}" = "True" ]; then ARGS="$ARGS --noconsole"; fi
+          [ "\${{ steps.cfg.outputs.onefile }}" = "True" ] && ARGS="$ARGS --onefile"
+          [ "\${{ steps.cfg.outputs.noconsole }}" = "True" ] && ARGS="$ARGS --noconsole --windowed"
+          HIDDEN="\${{ steps.cfg.outputs.hidden_imports }}"
+          if [ -n "$HIDDEN" ]; then
+            IFS=',' read -ra HIMPS <<< "$HIDDEN"
+            for h in "\${HIMPS[@]}"; do
+              h=$(echo $h | xargs)
+              ARGS="$ARGS --hidden-import=$h"
+            done
+          fi
+          echo "PyInstaller args: $ARGS"
           pyinstaller $ARGS src/main.py
-      - name: Upload artifact
+
+      - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: \${{ steps.cfg.outputs.exe_name }}-exe
+          name: \${{ steps.cfg.outputs.exe_name }}-windows-exe
           path: dist/\${{ steps.cfg.outputs.exe_name }}.exe
+          if-no-files-found: error
           retention-days: 7
-`);
-
-  try {
-    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/.github/workflows/build-exe.yml`);
-    log('Workflow already exists ✓', 'success');
-  } catch(e) {
-    log('Creating GitHub Actions workflow...', 'info');
-    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/.github/workflows/build-exe.yml`, 'PUT', {
-      message: 'Add PyForge build workflow',
-      content: workflowContent
-    });
-    log('Workflow created ✓', 'success');
-  }
+`;
 }
 
+// ── Push a single file (create or update) ────────────────────────────────────
 async function pushFile(path, content, message) {
-  const b64 = btoa(unescape(encodeURIComponent(content)));
+  // btoa fails on non-latin chars — use TextEncoder → Uint8Array → base64
+  const bytes = new TextEncoder().encode(content);
+  let binary = '';
+  bytes.forEach(b => binary += String.fromCharCode(b));
+  const b64 = btoa(binary);
+
   let sha = null;
   try {
     const existing = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${path}`);
     sha = existing.sha;
-  } catch(e) {}
+  } catch(e) { /* file doesn't exist yet — that's fine */ }
 
   const body = { message, content: b64 };
   if (sha) body.sha = sha;
-  
   await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${path}`, 'PUT', body);
 }
 
+// ── Ensure repo has at least one commit (initialize if empty) ─────────────────
+async function ensureRepoInitialized() {
+  try {
+    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/main`);
+    log('Repository has commits ✓', 'success');
+    return; // already has commits
+  } catch(e) {}
+
+  // Try 'master' branch
+  try {
+    await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/git/refs/heads/master`);
+    log('Repository has commits (master branch) ✓', 'success');
+    return;
+  } catch(e) {}
+
+  // Repo is empty — create initial README commit via Contents API
+  log('Repository is empty → Initializing with README...', 'warn');
+  const readmeB64 = btoa('# PyForge Builder\nThis repository is used by PyForge to build Python EXE files via GitHub Actions.\n');
+  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/README.md`, 'PUT', {
+    message: 'Initial commit by PyForge',
+    content: readmeB64
+  });
+  log('Repository initialized ✓', 'success');
+  await new Promise(r => setTimeout(r, 2000)); // let GitHub settle
+}
+
+// ── Ensure workflow file exists ───────────────────────────────────────────────
+async function ensureWorkflowExists() {
+  const wfPath = '.github/workflows/pyforge-build.yml';
+  const yaml = buildWorkflowYAML();
+
+  // btoa for workflow YAML (ASCII safe)
+  const b64 = btoa(unescape(encodeURIComponent(yaml)));
+
+  let sha = null;
+  try {
+    const existing = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`);
+    sha = existing.sha;
+    log('Updating workflow file...', 'info');
+  } catch(e) {
+    log('Creating GitHub Actions workflow...', 'info');
+  }
+
+  const body = {
+    message: sha ? 'Update PyForge workflow' : 'Add PyForge build workflow',
+    content: b64
+  };
+  if (sha) body.sha = sha;
+
+  await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/contents/${wfPath}`, 'PUT', body);
+  log('Workflow ready ✓', 'success');
+}
+
+// ── Poll for build completion ─────────────────────────────────────────────────
 async function waitForBuild(runId) {
   let attempts = 0;
-  const maxAttempts = 60;
-  
+  const maxAttempts = 72; // 72 × 10s = 12 minutes max
+
   return new Promise((resolve, reject) => {
     pollInterval = setInterval(async () => {
       attempts++;
       if (attempts > maxAttempts) {
         clearInterval(pollInterval);
-        reject(new Error('Build timeout (10 minutes exceeded)'));
+        reject(new Error('Build timeout — check GitHub Actions tab for details'));
         return;
       }
-
       try {
         const run = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/actions/runs/${runId}`);
-        const status = run.status;
-        const conclusion = run.conclusion;
-
-        log(`Build status: ${status} ${conclusion ? '→ ' + conclusion : ''} (${attempts * 10}s)`, 'info');
-
-        if (status === 'completed') {
+        const elapsed = Math.round(attempts * 10 / 60 * 10) / 10;
+        log(`Build: ${run.status}${run.conclusion ? ' → ' + run.conclusion : ''} (${elapsed}m)`, 'info');
+        if (run.status === 'completed') {
           clearInterval(pollInterval);
-          if (conclusion === 'success') {
-            resolve(run);
-          } else {
-            reject(new Error(`Build failed: ${conclusion}`));
+          if (run.conclusion === 'success') resolve(run);
+          else {
+            const logsUrl = `https://github.com/${CONFIG.username}/${CONFIG.repo}/actions/runs/${runId}`;
+            reject(new Error(`Build ${run.conclusion} — see logs: ${logsUrl}`));
           }
         }
       } catch(e) {
@@ -1051,23 +1164,60 @@ async function waitForBuild(runId) {
   });
 }
 
-async function startBuild() {
-  if (!loadConfig()) {
-    openSettings();
-    return;
+// ── Find the run ID triggered by our push ────────────────────────────────────
+async function findLatestRunId(afterTimestamp) {
+  // Retry up to 12 times (2 min) waiting for GitHub to register the run
+  for (let i = 0; i < 12; i++) {
+    await new Promise(r => setTimeout(r, 10000));
+    try {
+      const runs = await githubAPI(
+        `/repos/${CONFIG.username}/${CONFIG.repo}/actions/runs?per_page=10&event=push`
+      );
+      if (runs.workflow_runs && runs.workflow_runs.length > 0) {
+        // Find runs created after our push timestamp
+        const fresh = runs.workflow_runs.filter(r => {
+          return new Date(r.created_at) >= new Date(afterTimestamp - 30000);
+        });
+        if (fresh.length > 0) {
+          const run = fresh[0];
+          log(`Found workflow run #${run.run_number} (ID: ${run.id})`, 'success');
+          return run.id;
+        }
+      }
+      log(`Waiting for Actions to start... (${(i+1) * 10}s)`, 'warn');
+    } catch(e) {
+      log(`Waiting... (${e.message})`, 'warn');
+    }
   }
+  throw new Error('GitHub Actions did not start within 2 minutes. Check if Actions is enabled in your repo settings.');
+}
+
+// ── MAIN BUILD FUNCTION ───────────────────────────────────────────────────────
+async function startBuild() {
+  if (!loadConfig()) { openSettings(); return; }
 
   const code = document.getElementById('code-input').value.trim();
-  if (!code) {
-    alert('Python code লিখুন!');
-    return;
-  }
+  if (!code) { alert('Python code লিখুন!'); return; }
 
-  const exeName = document.getElementById('exe-name').value.trim() || 'myapp';
+  const exeName   = document.getElementById('exe-name').value.trim() || 'myapp';
   const pyVersion = document.getElementById('py-version').value;
-  const packages = document.getElementById('extra-packages').value.trim();
-  const onefile = document.getElementById('cb-onefile').checked;
+  const onefile   = document.getElementById('cb-onefile').checked;
   const noconsole = document.getElementById('cb-noconsole').checked;
+
+  // Auto-detect packages from code + merge with user-supplied
+  const autoPackages  = autoDetectPackages(code);
+  const userPackages  = document.getElementById('extra-packages').value
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const allPackages   = [...new Set([...autoPackages, ...userPackages])];
+
+  const hiddenImports = detectHiddenImports(code);
+
+  if (autoPackages.length > 0) {
+    log(`Auto-detected packages: ${autoPackages.join(', ')}`, 'info');
+  }
+  if (hiddenImports.length > 0) {
+    log(`Hidden imports added: ${hiddenImports.slice(0,4).join(', ')}${hiddenImports.length > 4 ? '...' : ''}`, 'info');
+  }
 
   document.getElementById('convert-btn').disabled = true;
   document.getElementById('download-card').classList.remove('show');
@@ -1076,67 +1226,74 @@ async function startBuild() {
   showProgress(true);
   setStatus('Building...', 'warn');
 
+  const pushTime = Date.now();
+
   try {
     log('Connecting to GitHub API...', 'info');
-    
     await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}`);
-    log(`Repository found: ${CONFIG.repo} ✓`, 'success');
+    log(`Repository "${CONFIG.repo}" found ✓`, 'success');
 
+    // 1. Make sure repo has at least one commit (fixes "Not Found" on empty repos)
+    await ensureRepoInitialized();
+
+    // 2. Push workflow (always update so new hidden-imports logic takes effect)
     await ensureWorkflowExists();
 
-    const config = {
+    // 3. Build config JSON
+    const buildConfig = {
       exe_name: exeName,
       python_version: pyVersion,
-      packages: packages,
-      onefile: onefile,
-      noconsole: noconsole
+      packages: allPackages.join(' '),
+      hidden_imports: hiddenImports.join(','),
+      onefile,
+      noconsole
     };
 
+    // 4. Push source + config — these two pushes trigger the workflow
     log('Pushing Python source code...', 'info');
-    await pushFile('src/main.py', code, `Update main.py via PyForge [${new Date().toISOString()}]`);
+    await pushFile('src/main.py', code, `[PyForge] Update source ${new Date().toISOString()}`);
 
-    log('Pushing build configuration...', 'info');
-    await pushFile('build_config.json', JSON.stringify(config, null, 2), 'Update build config');
+    log('Pushing build config...', 'info');
+    await pushFile('build_config.json', JSON.stringify(buildConfig, null, 2), '[PyForge] Update build config');
 
-    log('Build triggered! Waiting for GitHub Actions...', 'warn');
-    log('⏳ এটা 2-4 মিনিট লাগতে পারে...', 'warn');
+    log('✅ Code pushed! Waiting for GitHub Actions to start...', 'success');
+    log('⏳ PyQt5 EXE build লাগবে ৪-৬ মিনিট (first run)...', 'warn');
 
-    await new Promise(r => setTimeout(r, 8000));
+    // 5. Find the triggered run
+    buildRunId = await findLatestRunId(pushTime);
 
-    const runs = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/actions/runs?per_page=5&event=push`);
-    if (!runs.workflow_runs || runs.workflow_runs.length === 0) {
-      throw new Error('No workflow run found. Workflow may not have triggered yet.');
-    }
-    
-    const latestRun = runs.workflow_runs[0];
-    buildRunId = latestRun.id;
-    log(`Workflow run started: #${latestRun.run_number} (ID: ${buildRunId})`, 'info');
+    // 6. Poll until done
+    await waitForBuild(buildRunId);
 
-    const completedRun = await waitForBuild(buildRunId);
+    // 7. Get artifact download link
+    const artifacts = await githubAPI(
+      `/repos/${CONFIG.username}/${CONFIG.repo}/actions/runs/${buildRunId}/artifacts`
+    );
 
-    const artifacts = await githubAPI(`/repos/${CONFIG.username}/${CONFIG.repo}/actions/runs/${buildRunId}/artifacts`);
-    
     if (artifacts.artifacts && artifacts.artifacts.length > 0) {
       const artifact = artifacts.artifacts[0];
       const downloadUrl = `https://github.com/${CONFIG.username}/${CONFIG.repo}/actions/runs/${buildRunId}/artifacts/${artifact.id}`;
-      
-      log('✅ Build completed successfully!', 'success');
-      log(`EXE ready: ${exeName}.exe (${artifact.size_in_bytes ? Math.round(artifact.size_in_bytes / 1024) + ' KB' : 'size unknown'})`, 'success');
+      const sizeKB = artifact.size_in_bytes ? Math.round(artifact.size_in_bytes / 1024) : '?';
+
+      log(`✅ BUILD SUCCESS! ${exeName}.exe (~${sizeKB} KB)`, 'success');
+      log('📦 Download = ZIP file → unzip → run the .exe', 'info');
 
       document.getElementById('terminal-status').textContent = '● Success';
       document.getElementById('terminal-status').className = 'terminal-status';
-      
       document.getElementById('download-link').href = downloadUrl;
-      document.getElementById('download-info-text').textContent = 
-        `${exeName}.exe | Python ${pyVersion} | GitHub Actions artifact`;
+      document.getElementById('download-info-text').textContent =
+        `${exeName}.exe  •  Python ${pyVersion}  •  ${sizeKB} KB  •  GitHub artifact (ZIP → unzip → .exe)`;
       document.getElementById('download-card').classList.add('show');
       setStatus('Done ✓', 'success');
     } else {
-      throw new Error('Artifact not found after build');
+      throw new Error('Artifact not found — check Actions logs on GitHub');
     }
 
   } catch(err) {
-    log(`❌ Error: ${err.message}`, 'error');
+    log(`❌ ${err.message}`, 'error');
+    if (buildRunId) {
+      log(`🔗 Logs: https://github.com/${CONFIG.username}/${CONFIG.repo}/actions/runs/${buildRunId}`, 'warn');
+    }
     document.getElementById('terminal-status').textContent = '● Failed';
     document.getElementById('terminal-status').className = 'terminal-status error';
     setStatus('Error', 'error');
